@@ -4419,6 +4419,122 @@ def test_ring_mla_metadata_matches_scalar_rotation(kv_actual_isl, full_mesh):
         close_ring_joint_sdpa_runtime(runtime)
 
 
+@pytest.mark.parametrize(
+    "chunk_local, local_heads, d_k, d_v, k_chunk, kv_actual_isl, new_actual_isl",
+    [
+        (64, 4, 64, 32, 32, 0, None),
+        (64, 4, 64, 32, 32, 0, 96),
+        (64, 4, 64, 32, 32, 64, 96),
+        (64, 4, 64, 32, 32, 256, 160),
+        (640, 8, 320, 256, 640, 0, None),
+        (640, 8, 320, 256, 640, 0, 1024),
+        (640, 8, 320, 256, 640, 5120, 1280),
+    ],
+    ids=["toy-full", "toy-0-96", "toy-64-96", "toy-256-160", "mistral-full", "mistral-0-1024", "mistral-5120-1280"],
+)
+def test_ring_mla_kv_valid_end_matches_unclamped(
+    chunk_local, local_heads, d_k, d_v, k_chunk, kv_actual_isl, new_actual_isl
+):
+    """kv_valid_end_tensor must not change the real rows. Padded KV rows hold large garbage, so a clamp
+    that reads past the last real tile changes the output."""
+    mesh_config = MESH_CONFIG
+    sp_size = mesh_config.sp_size
+    if sp_size < 2:
+        pytest.skip(f"ring_mla requires at least 2 devices in ring, got SP={sp_size}")
+    chunk_size_global = chunk_local * sp_size
+    new_actual_isl = new_actual_isl or chunk_size_global
+    b, nhk = 1, 1
+    nhq = local_heads * mesh_config.tp_size
+    logical_n = kv_actual_isl + new_actual_isl
+
+    torch.manual_seed(1234)
+    q_host, kv_host, valid_rows, kv_valid_per_dev, num_cache_slabs = build_kv_pad_rotation_mla_inputs(
+        fa_rand(b, nhk, kv_actual_isl, d_k),
+        fa_rand(b, nhq, new_actual_isl, d_k),
+        fa_rand(b, nhk, new_actual_isl, d_k),
+        kv_actual_isl,
+        sp_size,
+        chunk_local,
+    )
+    cache_seq_per_dev = num_cache_slabs * chunk_local
+    kv_per_dev = kv_host.reshape(1, nhk, sp_size, cache_seq_per_dev, d_k)
+    kv_valid = kv_valid_per_dev.reshape(1, 1, sp_size, cache_seq_per_dev, 1)
+    kv_host = torch.where(kv_valid, kv_per_dev, torch.randn_like(kv_per_dev) * 100).reshape(kv_host.shape)
+
+    runtime = open_ring_joint_sdpa_runtime(mesh_config)
+    mesh_device = runtime.mesh_device
+    try:
+        q_shard_dims = [None, None]
+        q_shard_dims[runtime.sp_axis] = 2
+        if mesh_config.tp_size > 1:
+            q_shard_dims[runtime.tp_axis] = 1
+        kv_shard_dims = [None, None]
+        kv_shard_dims[runtime.sp_axis] = 2
+        mesh_shape = tuple(mesh_device.shape)
+        composer = ttnn.create_mesh_composer(
+            mesh_device,
+            ttnn.MeshComposerConfig(*(dim if dim is not None else -1 for dim in q_shard_dims)),
+        )
+        tt_q = ttnn.from_torch(
+            q_host,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=mesh_device,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=mesh_shape, dims=q_shard_dims),
+        )
+        tt_kv = ttnn.from_torch(
+            kv_host,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=mesh_device,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=mesh_shape, dims=kv_shard_dims),
+        )
+        program_config = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=runtime.sdpa_compute_grid,
+            q_chunk_size=32,
+            k_chunk_size=k_chunk,
+            exp_approx_mode=False,
+        )
+        tt_slot_id, tt_kv_actual_isl = _make_ring_mla_metadata(mesh_device, slot_id=0, actual_start=kv_actual_isl)
+        tt_kv_valid_end = _make_ring_mla_scalar_tensor(mesh_device, logical_n)
+
+        def run(kv_valid_end_tensor):
+            tt_out, _ = ttnn.transformer.ring_mla(
+                tt_q,
+                tt_kv,
+                persistent_output_buffer_kv=ttnn.from_torch(
+                    torch.zeros(b, nhk, sp_size * cache_seq_per_dev, d_k),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=mesh_device,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+                ),
+                head_dim_v=d_v,
+                logical_n=logical_n,
+                is_balanced=False,
+                program_config=program_config,
+                compute_kernel_config=runtime.compute_kernel_config,
+                dim=2,
+                multi_device_global_semaphore=runtime.ccl_semaphore_handles,
+                num_links=runtime.num_links,
+                cluster_axis=runtime.sp_axis,
+                mesh_device=mesh_device,
+                topology=runtime.topology,
+                subdevice_id=runtime.worker_sub_device_id,
+                ccl_core_grid_offset=(runtime.ccl_column, 0),
+                use_column_major_ccl=True,
+                slot_id=tt_slot_id,
+                kv_actual_isl_tensor=tt_kv_actual_isl,
+                kv_valid_end_tensor=kv_valid_end_tensor,
+            )
+            return ttnn.to_torch(tt_out, mesh_composer=composer)[:, :, valid_rows, :d_v]
+
+        passed, pcc = comp_pcc(run(None), run(tt_kv_valid_end), 0.9999)
+        assert passed, f"kv_valid_end changed the real-row output: PCC={pcc}"
+    finally:
+        close_ring_joint_sdpa_runtime(runtime)
+
+
 def _ring_mla_host_scalar_tensor(mesh_device, value):
     """HOST-side twin of _make_ring_mla_scalar_tensor, for refreshing a metadata tensor in place with
     ttnn.copy_host_to_device_tensor (the specs must match exactly). Mirrors the runner's own update path."""
