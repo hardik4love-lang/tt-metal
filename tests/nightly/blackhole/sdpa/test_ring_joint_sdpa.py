@@ -4435,8 +4435,10 @@ def test_ring_mla_metadata_matches_scalar_rotation(kv_actual_isl, full_mesh):
 def test_ring_mla_kv_valid_end_matches_unclamped(
     chunk_local, local_heads, d_k, d_v, k_chunk, kv_actual_isl, new_actual_isl
 ):
-    """kv_valid_end_tensor must not change the real rows. Padded KV rows hold large garbage, so a clamp
-    that reads past the last real tile changes the output."""
+    """kv_valid_end_tensor must not change the real rows (padded KV rows hold large garbage), and the
+    kernel must actually read it: a valid end one tile past the cached prefix skips the later real rows,
+    so their output has to differ from the unclamped run. Without that control, an op that ignored the
+    tensor would pass the equality check."""
     mesh_config = MESH_CONFIG
     sp_size = mesh_config.sp_size
     if sp_size < 2:
@@ -4529,8 +4531,17 @@ def test_ring_mla_kv_valid_end_matches_unclamped(
             )
             return ttnn.to_torch(tt_out, mesh_composer=composer)[:, :, valid_rows, :d_v]
 
-        passed, pcc = comp_pcc(run(None), run(tt_kv_valid_end), 0.9999)
+        unclamped = run(None)
+        passed, pcc = comp_pcc(unclamped, run(tt_kv_valid_end), 0.9999)
         assert passed, f"kv_valid_end changed the real-row output: PCC={pcc}"
+
+        # Negative control: the kernel only honours a valid end strictly between the chunk start and the
+        # padded end, so one tile past the cached prefix must drop the real rows that follow it.
+        tt_kv_valid_end_early = _make_ring_mla_scalar_tensor(mesh_device, kv_actual_isl + 32)
+        passed_early, pcc_early = comp_pcc(unclamped, run(tt_kv_valid_end_early), 0.9999)
+        assert (
+            not passed_early
+        ), f"kv_valid_end_tensor was ignored: an early valid end left the output unchanged, PCC={pcc_early}"
     finally:
         close_ring_joint_sdpa_runtime(runtime)
 
