@@ -148,3 +148,17 @@
   owner_id: U088DBNUKGR # Evan Smal
   team: ttnn
   budget_type: e2e
+
+# CI probe for #60594/#60595: D2HStreamService and layer-completion records run only on Blackhole Galaxy.
+- id: bh-galaxy-d2h-stream-service
+  name: BH Galaxy D2H stream service and layer completion tests
+  cmd: |
+    pytest -v tests/ttnn/unit_tests/base_functionality/test_d2h_stream_service.py tests/ttnn/unit_tests/base_functionality/test_layer_ack_service.py tests/ttnn/unit_tests/base_functionality/test_layer_completion_ring_reader.py tests/ttnn/unit_tests/base_functionality/test_layer_completion_ring_writer.py models/demos/common/prefill/tests/test_layer_completion_layout.py
+    ./build/test/ttnn/unit_tests_ttnn_tensor --gtest_filter='D2HStreamServiceTest.*'
+    ./build/test/tt_metal/distributed/distributed_unit_tests --gtest_filter='LayerAckDecoder*:LayerCompletion*'
+  skus:
+    bh_galaxy:
+      timeout: 30
+  owner_id: U08UBDUKH6Z # Neel Nyamagoudar
+  team: scaleout
+  budget_type: e2e
